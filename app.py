@@ -1,3 +1,10 @@
+Here is a refined, ready-to-use version of your app code with:
+
+- Safer yfinance usage (cached, no EPS-series gymnastics).
+- Cleaner intrinsic logic using trailing/normalized EPS.
+- Better null checks and display logic.
+
+```python
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -39,7 +46,11 @@ def xirr(cashflows):
         df = (xnpv(r + 1e-5, cashflows) - f) / 1e-5
         if abs(df) < 1e-10:
             break
-        r -= f / df
+        # Newton iteration
+        try:
+            r -= f / df
+        except ZeroDivisionError:
+            return None
         r = max(-0.99, min(r, 10))
     return r
 
@@ -47,22 +58,38 @@ def xirr(cashflows):
 # NIFTY BENCHMARK (ROBUST)
 # ============================================================
 
+@st.cache_data(ttl=86400)
+def get_nifty_history(start, end):
+    df = yf.download("^NSEI", start=start, end=end, progress=False)
+    return df
+
 def compute_nifty_xirr(portfolio_cf, valuation_date):
+    if not portfolio_cf:
+        return None, "No portfolio cashflows"
+
     start = min(d for d, _ in portfolio_cf)
-    df = yf.download("^NSEI", start=start - timedelta(days=10),
-                     end=valuation_date + timedelta(days=10), progress=False)
-    if df.empty:
+    df = get_nifty_history(start - timedelta(days=10), valuation_date + timedelta(days=10))
+    if df is None or df.empty:
         return None, "NIFTY data unavailable"
 
     prices = df["Close"].dropna()
+    if prices.empty:
+        return None, "NIFTY prices unavailable"
+
     units = 0.0
     bench_cf = []
 
     for d, amt in portfolio_cf:
         if amt < 0:
-            px = prices[prices.index <= pd.Timestamp(d)].iloc[-1]
+            closest = prices[prices.index <= pd.Timestamp(d)]
+            if closest.empty:
+                continue
+            px = closest.iloc[-1]
             units += abs(amt) / px
             bench_cf.append((d, amt))
+
+    if units <= 0:
+        return None, "No buys to simulate benchmark"
 
     final_px = prices.iloc[-1]
     bench_cf.append((valuation_date, units * final_px))
@@ -74,92 +101,106 @@ def compute_nifty_xirr(portfolio_cf, valuation_date):
 
 @st.cache_data(ttl=86400)
 def get_stock_fundamentals(ticker):
+    """
+    Single yfinance call per ticker, cached.
+    Uses trailing/forward EPS and simple normalization.
+    """
     try:
         t = yf.Ticker(ticker)
-        info = t.info
-        fin = t.financials
+        info = t.info or {}
 
-        eps_series = None
-        shares = info.get("sharesOutstanding")
-        if fin is not None and not fin.empty and shares:
-            if "Net Income" in fin.index:
-                eps_series = (fin.loc["Net Income"] / shares).dropna()
+        trailing_eps = info.get("trailingEps") or 0
+        forward_eps = info.get("forwardEps") or 0
+
+        # Conservative normalized EPS:
+        if trailing_eps and forward_eps:
+            norm_eps = (trailing_eps + forward_eps) / 2
+        elif trailing_eps:
+            norm_eps = trailing_eps * 0.9
+        elif forward_eps:
+            norm_eps = forward_eps * 0.8
+        else:
+            norm_eps = 0
 
         return {
-            "sector": info.get("sector", ""),
-            "roe": info.get("returnOnEquity"),
-            "bvps": info.get("bookValue"),
-            "trailing_eps": info.get("trailingEps"),
-            "eps_series": eps_series
+            "sector": (info.get("sector") or "").lower(),
+            "roe": info.get("returnOnEquity") or 0,
+            "bvps": info.get("bookValue") or 0,
+            "trailing_eps": float(trailing_eps) if trailing_eps else 0.0,
+            "norm_eps": float(norm_eps) if norm_eps else 0.0,
         }
-    except:
-        return {}
+    except Exception:
+        return {
+            "sector": "",
+            "roe": 0,
+            "bvps": 0,
+            "trailing_eps": 0.0,
+            "norm_eps": 0.0,
+        }
 
 # ============================================================
 # INTRINSIC VALUATION (FINAL DESIGN)
 # ============================================================
 
-def classify_business(sector):
-    s = sector.lower()
+def classify_business(sector: str):
+    s = (sector or "").lower()
     if "bank" in s:
         return "BANK"
-    if any(x in s for x in ["it", "software", "pharma"]):
+    if any(x in s for x in ["it", "software", "pharma", "services"]):
         return "ASSET_LIGHT"
-    if any(x in s for x in ["metal", "energy", "oil", "power"]):
+    if any(x in s for x in ["metal", "energy", "oil", "power", "commodity"]):
         return "CYCLICAL"
     return "GENERAL"
 
-def intrinsic_for_stock(ticker, cmp):
+def intrinsic_for_stock(ticker, cmp_price):
     data = get_stock_fundamentals(ticker)
-    if not data:
-        return None, None, "Low"
-
-    biz = classify_business(data["sector"])
-    eps_series = data["eps_series"]
-    trailing_eps = data["trailing_eps"]
+    sector = data["sector"]
     roe = data["roe"]
     bvps = data["bvps"]
+    norm_eps = data["norm_eps"]
+    trailing_eps = data["trailing_eps"]
+
+    biz = classify_business(sector)
 
     # ---- BANKS ----
     if biz == "BANK":
-        if bvps and roe:
+        if bvps > 0 and roe:
+            # Cost of equity ~ 13% for Indian banks, clipped to reasonable bounds
             target_pb = max(0.8, min(2.0, roe / 0.13))
-            floor = bvps * target_pb * 0.9
+            floor = bvps * target_pb * 0.9     # small MoS inside band
             ceiling = floor * 1.20
-            return round(floor,2), round(ceiling,2), "High"
+            return round(floor, 2), round(ceiling, 2), "High"
         return None, None, "Low"
 
     # ---- EPS NORMALIZATION ----
-    norm_eps = None
-    confidence = "Low"
-
-    if eps_series is not None and len(eps_series) >= 3:
-        norm_eps = eps_series.tail(3).mean()
-        confidence = "High"
-    elif trailing_eps:
-        norm_eps = trailing_eps * 0.8  # conservative fallback
-        confidence = "Medium"
-
-    if not norm_eps or norm_eps <= 0:
+    eps = norm_eps if norm_eps > 0 else trailing_eps * 0.8
+    if eps <= 0:
         return None, None, "Low"
+
+    confidence = "Medium"
 
     # ---- VALUATION BY TYPE ----
     if biz == "ASSET_LIGHT":
-        floor, ceiling = norm_eps * 16, norm_eps * 22
+        # Quality compounders: 16–22x normalized EPS
+        floor, ceiling = eps * 16, eps * 22
+        confidence = "High"
     elif biz == "CYCLICAL":
-        floor, ceiling = norm_eps * 9, norm_eps * 13
+        # Cyclicals: tighter mid-cycle band with low confidence
+        floor, ceiling = eps * 9, eps * 13
         confidence = "Low"
     else:  # GENERAL
-        floor, ceiling = norm_eps * 13, norm_eps * 18
-        if confidence == "High":
-            confidence = "Medium"
+        floor, ceiling = eps * 13, eps * 18
+        # Do not upgrade to High; keep Medium at best
+        confidence = "Medium"
 
-    return round(floor,2), round(ceiling,2), confidence
+    return round(floor, 2), round(ceiling, 2), confidence
 
-def margin_of_safety(cmp, floor):
-    if cmp and floor:
-        return round((floor - cmp) / floor * 100, 2)
-    return None
+def margin_of_safety(cmp_price, floor):
+    if cmp_price is None or floor is None:
+        return None
+    if cmp_price <= 0 or floor <= 0:
+        return None
+    return round((floor - cmp_price) / floor * 100, 2)
 
 # ============================================================
 # HELPERS
@@ -192,6 +233,7 @@ if uploaded:
     df = clean_df(raw)
     valuation_date = st.date_input("Valuation Date", value=date.today())
 
+    # Allow user to tweak CMPs
     cmp_df = df.groupby("Ticker")["CMP"].max().reset_index()
     cmp_edit = st.data_editor(cmp_df, hide_index=True)
 
@@ -201,39 +243,50 @@ if uploaded:
         portfolio_cf = []
 
         for tkr, g in df.groupby("Ticker"):
-            qty = invested = realized = 0
+            qty = 0
+            invested = 0.0
+            realized = 0.0
             cashflows = []
 
             for _, r in g.iterrows():
-                amt = -(r["Quantity"] * r["Price"] + r["Charges"]) if r["Action"] == "BUY" \
-                      else (r["Quantity"] * r["Price"] - r["Charges"])
-                qty += r["Quantity"] if r["Action"] == "BUY" else -r["Quantity"]
-                invested += -amt if r["Action"] == "BUY" else 0
-                realized += amt if r["Action"] == "SELL" else 0
+                if r["Action"] == "BUY":
+                    amt = -(r["Quantity"] * r["Price"] + r["Charges"])
+                    qty += r["Quantity"]
+                    invested += -amt
+                else:  # SELL
+                    amt = r["Quantity"] * r["Price"] - r["Charges"]
+                    qty -= r["Quantity"]
+                    realized += amt
+
                 cashflows.append((r["Date"], amt))
                 portfolio_cf.append((r["Date"], amt))
 
-            cmp = cmp_map.get(tkr, 0)
-            curr_val = qty * cmp
+            cmp_price = float(cmp_map.get(tkr, 0))
+            curr_val = qty * cmp_price
             if qty > 0:
                 cashflows.append((valuation_date, curr_val))
                 portfolio_cf.append((valuation_date, curr_val))
 
             r = xirr(cashflows)
-            floor, ceiling, conf = intrinsic_for_stock(tkr, cmp)
-            mos = margin_of_safety(cmp, floor)
+            floor, ceiling, conf = intrinsic_for_stock(tkr, cmp_price)
+            mos = margin_of_safety(cmp_price, floor)
+
+            if floor is not None and ceiling is not None:
+                intr_str = f"{floor} – {ceiling}"
+            else:
+                intr_str = "NA"
 
             rows.append({
                 "Ticker": tkr,
                 "Holding Qty": qty,
-                "CMP": cmp,
+                "CMP": cmp_price,
                 "Current Value": curr_val,
                 "Total Invested": invested,
                 "Total Realized": realized,
                 "XIRR %": None if r is None else round(r * 100, 2),
-                "Intrinsic Range (₹)": f"{floor} – {ceiling}" if floor else "NA",
+                "Intrinsic Range (₹)": intr_str,
                 "MoS %": mos,
-                "Valuation Confidence": conf
+                "Valuation Confidence": conf,
             })
 
         stock_df = pd.DataFrame(rows)
@@ -245,8 +298,12 @@ if uploaded:
 
         st.subheader("📊 Portfolio vs NIFTY 50")
         c1, c2, c3 = st.columns(3)
-        c1.metric("Portfolio XIRR", f"{px*100:.2f}%" if px else "NA")
-        c2.metric("NIFTY XIRR", f"{nx*100:.2f}%" if nx else "NA")
-        c3.metric("Alpha", f"{(px-nx)*100:.2f}%" if px and nx else "NA")
+        c1.metric("Portfolio XIRR", f"{px*100:.2f}%" if px is not None else "NA")
+        c2.metric("NIFTY XIRR", f"{nx*100:.2f}%" if nx is not None else "NA")
+        c3.metric(
+            "Alpha",
+            f"{(px - nx)*100:.2f}%" if (px is not None and nx is not None) else "NA",
+        )
 
         st.caption(f"NIFTY benchmark note: {note}")
+```
