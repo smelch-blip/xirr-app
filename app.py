@@ -1,42 +1,27 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, date
+import yfinance as yf
+from datetime import datetime, date, timedelta
 
-# =========================
+# ============================================================
 # CONFIG
-# =========================
-REQUIRED_COLUMNS = ["Ticker", "Date", "Action", "Quantity", "Price", "Charges", "CMP"]
-ACTION_ALLOWED = {"BUY", "SELL"}  # corporate actions/dividends not handled in this version
+# ============================================================
 
-st.set_page_config(page_title="Stock XIRR Analyzer", layout="wide")
-st.title("📈 Stock-wise XIRR + Portfolio XIRR (Upload → CMP Editable → Results)")
+REQUIRED_COLUMNS = ["Ticker", "Date", "Action", "Quantity", "Price", "Charges", "CMP"]
+ACTION_ALLOWED = {"BUY", "SELL"}
+
+st.set_page_config(page_title="Portfolio XIRR Analyzer", layout="wide")
+st.title("📈 Stock-wise XIRR + Portfolio XIRR + NIFTY Benchmark")
 
 st.warning(
     "⚠️ Corporate actions (splits/bonus) and dividends are NOT auto-captured in this version. "
-    "If these apply to your holdings, XIRR can be skewed."
+    "If these apply to your holdings and are not reflected in quantities/cashflows, XIRR may be skewed."
 )
 
-# =========================
-# HELPERS
-# =========================
-def parse_date_safe(x):
-    if pd.isna(x):
-        return None
-    if isinstance(x, (datetime, date)):
-        return pd.to_datetime(x).date()
-    try:
-        return pd.to_datetime(str(x), dayfirst=True, errors="coerce").date()
-    except Exception:
-        return None
-
-def to_float_safe(x, default=0.0):
-    try:
-        if pd.isna(x) or x == "":
-            return default
-        return float(x)
-    except Exception:
-        return default
+# ============================================================
+# XIRR ENGINE
+# ============================================================
 
 def xnpv(rate, cashflows):
     if rate <= -0.999999:
@@ -49,10 +34,6 @@ def xnpv(rate, cashflows):
     return total
 
 def xirr(cashflows):
-    """
-    Returns rate as decimal (0.15 = 15%), or None if not solvable.
-    Uses Newton then bisection fallback.
-    """
     if len(cashflows) < 2:
         return None
     amounts = [amt for _, amt in cashflows]
@@ -61,7 +42,7 @@ def xirr(cashflows):
 
     # Newton-Raphson
     r = 0.15
-    for _ in range(60):
+    for _ in range(50):
         f = xnpv(r, cashflows)
         dr = 1e-5
         f2 = xnpv(r + dr, cashflows)
@@ -76,7 +57,7 @@ def xirr(cashflows):
             return r_new
         r = r_new
 
-    # Bracket + Bisection
+    # Bisection fallback
     grid = np.concatenate([
         np.linspace(-0.9, 0.0, 30),
         np.linspace(0.0, 1.0, 50),
@@ -84,225 +65,214 @@ def xirr(cashflows):
     ])
     prev_r = grid[0]
     prev_f = xnpv(prev_r, cashflows)
-    bracket = None
     for rr in grid[1:]:
         ff = xnpv(rr, cashflows)
-        if np.isfinite(prev_f) and np.isfinite(ff) and (prev_f == 0 or ff == 0 or (prev_f * ff < 0)):
-            bracket = (prev_r, rr)
+        if np.isfinite(prev_f) and np.isfinite(ff) and (prev_f * ff < 0):
+            a, b = prev_r, rr
             break
         prev_r, prev_f = rr, ff
-
-    if bracket is None:
+    else:
         return None
 
-    a, b = bracket
     fa, fb = xnpv(a, cashflows), xnpv(b, cashflows)
-    if not (np.isfinite(fa) and np.isfinite(fb)):
-        return None
-
     for _ in range(80):
-        mid = (a + b) / 2.0
+        mid = (a + b) / 2
         fm = xnpv(mid, cashflows)
-        if not np.isfinite(fm):
-            return None
         if abs(fm) < 1e-8:
             return mid
         if fa * fm < 0:
             b, fb = mid, fm
         else:
             a, fa = mid, fm
-    return (a + b) / 2.0
-# =========================
-# BENCHMARK: NIFTY 50 XIRR
-# =========================
-import yfinance as yf
-...
-def compute_nifty_xirr(...):
-    ...
-def make_template():
-    return pd.DataFrame([
-        {"Ticker": "INFY", "Date": "2019-06-10", "Action": "BUY",  "Quantity": 10, "Price": 700,  "Charges": 0, "CMP": 0},
-        {"Ticker": "INFY", "Date": "2020-01-15", "Action": "BUY",  "Quantity": 5,  "Price": 800,  "Charges": 0, "CMP": 0},
-        {"Ticker": "INFY", "Date": "2021-05-20", "Action": "SELL", "Quantity": 3,  "Price": 1200, "Charges": 0, "CMP": 0},
-        {"Ticker": "TCS",  "Date": "2023-07-01", "Action": "BUY",  "Quantity": 2,  "Price": 3500, "Charges": 0, "CMP": 0},
-    ])
+    return (a + b) / 2
 
-def validate_columns(df):
-    return [c for c in REQUIRED_COLUMNS if c not in df.columns]
+# ============================================================
+# BENCHMARK: NIFTY 50
+# ============================================================
+
+NIFTY_TICKER = "^NSEI"
+
+def fetch_nifty_prices(start_date, end_date):
+    df = yf.download(
+        NIFTY_TICKER,
+        start=start_date - timedelta(days=5),
+        end=end_date + timedelta(days=5),
+        progress=False,
+        auto_adjust=False
+    )
+    if df.empty:
+        return None
+    return df[["Close"]].dropna()
+
+def nifty_price_on_or_before(price_df, target_date):
+    eligible = price_df[price_df.index <= pd.Timestamp(target_date)]
+    if eligible.empty:
+        return None
+    return float(eligible.iloc[-1]["Close"])
+
+def compute_nifty_xirr(portfolio_cashflows, valuation_date):
+    dates = [d for d, _ in portfolio_cashflows]
+    start_date = min(dates)
+    nifty_prices = fetch_nifty_prices(start_date, valuation_date)
+    if nifty_prices is None:
+        return None, None
+
+    nifty_units = 0.0
+    benchmark_cashflows = []
+
+    for d, amt in portfolio_cashflows:
+        if amt < 0:
+            px = nifty_price_on_or_before(nifty_prices, d)
+            if px is None:
+                return None, None
+            nifty_units += abs(amt) / px
+            benchmark_cashflows.append((d, amt))
+
+    final_px = nifty_price_on_or_before(nifty_prices, valuation_date)
+    if final_px is None:
+        return None, None
+
+    benchmark_value = nifty_units * final_px
+    benchmark_cashflows.append((valuation_date, benchmark_value))
+
+    return xirr(benchmark_cashflows), benchmark_value
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def parse_date(x):
+    return pd.to_datetime(x, errors="coerce").date()
 
 def clean_transactions(df):
     df = df.copy()[REQUIRED_COLUMNS]
     df["Ticker"] = df["Ticker"].astype(str).str.strip().str.upper()
     df["Action"] = df["Action"].astype(str).str.strip().str.upper()
-    df["Date"] = df["Date"].apply(parse_date_safe)
-    df = df[df["Date"].notna()].copy()
+    df["Date"] = df["Date"].apply(parse_date)
 
     for col in ["Quantity", "Price", "Charges", "CMP"]:
-        df[col] = df[col].apply(to_float_safe)
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
-    unsupported = df[~df["Action"].isin(ACTION_ALLOWED)]
-    if len(unsupported) > 0:
-        st.info(
-            f"ℹ️ Ignoring {len(unsupported)} rows with unsupported Action "
-            f"(only BUY/SELL used): {sorted(set(unsupported['Action'].tolist()))}"
-        )
-        df = df[df["Action"].isin(ACTION_ALLOWED)].copy()
-
-    df = df[df["Ticker"].ne("")].copy()
-    df = df[df["Quantity"] > 0].copy()
-    df = df[df["Price"] >= 0].copy()
-    df = df.sort_values(["Ticker", "Date"]).reset_index(drop=True)
-    return df
+    df = df[df["Action"].isin(ACTION_ALLOWED)]
+    df = df[df["Date"].notna()]
+    return df.sort_values(["Ticker", "Date"]).reset_index(drop=True)
 
 def build_cmp_table(df):
-    cmp_map = {}
-    for tkr, g in df.groupby("Ticker"):
-        vals = g["CMP"].tolist()
-        nz = [v for v in vals if v and v > 0]
-        cmp_map[tkr] = float(nz[-1]) if nz else (float(vals[-1]) if vals else 0.0)
-    return pd.DataFrame([{"Ticker": k, "CMP": v} for k, v in sorted(cmp_map.items())])
-
-def compute_xirr(df, cmp_override, valuation_date):
-    cmp_override = cmp_override.set_index("Ticker")["CMP"].to_dict()
-
     rows = []
-    all_cashflows = []
-
     for tkr, g in df.groupby("Ticker"):
-        g = g.sort_values("Date").copy()
-        first_buy = g[g["Action"] == "BUY"]["Date"].min()
-        last_txn = g["Date"].max()
+        nz = g["CMP"][g["CMP"] > 0]
+        cmp_val = nz.iloc[-1] if not nz.empty else 0.0
+        rows.append({"Ticker": tkr, "CMP": round(float(cmp_val), 2)})
+    return pd.DataFrame(rows)
 
-        qty = 0.0
-        invested = 0.0
-        realized = 0.0
-        cashflows = []
-
-        for _, r in g.iterrows():
-            q = float(r["Quantity"])
-            p = float(r["Price"])
-            ch = float(r["Charges"])
-            dt = r["Date"]
-
-            if r["Action"] == "BUY":
-                amt = -(q * p + ch)
-                qty += q
-                invested += (q * p + ch)
-            else:
-                amt = +(q * p - ch)
-                qty -= q
-                realized += (q * p - ch)
-
-            cashflows.append((dt, amt))
-
-        cmp_val = float(cmp_override.get(tkr, 0.0))
-        current_value = qty * cmp_val
-
-        # terminal valuation cashflow
-        if abs(current_value) > 1e-9:
-            cashflows.append((valuation_date, current_value))
-
-        r = xirr(cashflows)
-        all_cashflows.extend(cashflows)
-
-        rows.append({
-            "Ticker": tkr,
-            "First Buy Date": first_buy,
-            "Last Transaction Date": last_txn,
-            "Holding Qty (Current)": round(qty, 4),
-            "CMP (Editable)": round(cmp_val, 2),
-            "Current Value (Qty×CMP)": round(current_value, 2),
-            "Total Invested (Buys incl Charges)": round(invested, 2),
-            "Total Realized (Sells net Charges)": round(realized, 2),
-            "XIRR %": None if r is None else round(r * 100, 2),
-            "XIRR Status": "Not computable" if r is None else "OK",
-        })
-
-    stock_df = pd.DataFrame(rows).sort_values(["XIRR %"], ascending=False, na_position="last")
-
-    overall_r = xirr(all_cashflows)
-    overall = {
-        "Overall XIRR %": None if overall_r is None else round(overall_r * 100, 2),
-        "Total Invested": round(stock_df["Total Invested (Buys incl Charges)"].sum(), 2) if not stock_df.empty else 0.0,
-        "Total Realized": round(stock_df["Total Realized (Sells net Charges)"].sum(), 2) if not stock_df.empty else 0.0,
-        "Total Current Value": round(stock_df["Current Value (Qty×CMP)"].sum(), 2) if not stock_df.empty else 0.0,
-        "Valuation Date": valuation_date,
-    }
-    return stock_df, overall
-
-# =========================
+# ============================================================
 # UI: TEMPLATE
-# =========================
-with st.expander("📄 Download the exact upload format (template)"):
-    tmpl = make_template()
-    st.dataframe(tmpl, use_container_width=True, hide_index=True)
-    st.download_button(
-        "⬇️ Download template CSV",
-        data=tmpl.to_csv(index=False).encode("utf-8"),
-        file_name="PortfolioImportTemplate.csv",
-        mime="text/csv"
-    )
-    st.markdown("**Exact column names required:** `Ticker, Date, Action, Quantity, Price, Charges, CMP`")
+# ============================================================
 
-# =========================
+with st.expander("📄 Download upload template"):
+    tmpl = pd.DataFrame([
+        {"Ticker": "INFY", "Date": "2019-06-10", "Action": "BUY", "Quantity": 10, "Price": 700, "Charges": 0, "CMP": 0},
+        {"Ticker": "INFY", "Date": "2021-05-20", "Action": "SELL", "Quantity": 3, "Price": 1200, "Charges": 0, "CMP": 0},
+    ])
+    st.dataframe(tmpl, use_container_width=True, hide_index=True)
+    st.download_button("⬇️ Download CSV", tmpl.to_csv(index=False), "PortfolioImportTemplate.csv")
+
+# ============================================================
 # UI: UPLOAD
-# =========================
-st.markdown("### Upload your transactions CSV")
+# ============================================================
+
 uploaded = st.file_uploader("Upload CSV", type=["csv"])
 
 if uploaded:
     raw = pd.read_csv(uploaded)
-    missing = validate_columns(raw)
+    missing = [c for c in REQUIRED_COLUMNS if c not in raw.columns]
     if missing:
-        st.error(f"Missing columns: {missing}. Please use the template and keep EXACT names.")
+        st.error(f"Missing columns: {missing}")
         st.stop()
 
     df = clean_transactions(raw)
-    if df.empty:
-        st.error("No valid BUY/SELL rows after cleaning. Check your file.")
-        st.stop()
 
-    st.markdown("### Choose valuation date (usually today)")
     valuation_date = st.date_input("Valuation date", value=date.today())
 
-    st.markdown("### Edit CMP per stock (because Yahoo can be flaky)")
     cmp_df = build_cmp_table(df)
     edited_cmp = st.data_editor(
         cmp_df,
-        use_container_width=True,
         hide_index=True,
-        num_rows="fixed",
+        use_container_width=True,
         column_config={
             "Ticker": st.column_config.TextColumn(disabled=True),
-            "CMP": st.column_config.NumberColumn(min_value=0.0, step=0.05),
+            "CMP": st.column_config.NumberColumn(step=0.05)
         }
     )
 
-    if st.button("🚀 Compute Stock XIRR + Overall XIRR"):
-        stock_df, overall = compute_xirr(df, edited_cmp, valuation_date)
+    if st.button("🚀 Compute XIRR"):
+        cmp_map = dict(zip(edited_cmp["Ticker"], edited_cmp["CMP"]))
 
-        st.subheader("✅ Overall Portfolio Summary")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Overall XIRR %", "—" if overall["Overall XIRR %"] is None else f'{overall["Overall XIRR %"]}%')
-        c2.metric("Total Invested", f'₹{overall["Total Invested"]:,.0f}')
-        c3.metric("Total Realized", f'₹{overall["Total Realized"]:,.0f}')
-        c4.metric("Total Current Value", f'₹{overall["Total Current Value"]:,.0f}')
+        stock_rows = []
+        portfolio_cashflows = []
 
-        st.subheader("📌 Stock-wise XIRR (sorted by XIRR)")
+        for tkr, g in df.groupby("Ticker"):
+            qty = 0.0
+            invested = 0.0
+            realized = 0.0
+            cashflows = []
+
+            for _, r in g.iterrows():
+                dt = r["Date"]
+                q = r["Quantity"]
+                p = r["Price"]
+                ch = r["Charges"]
+
+                if r["Action"] == "BUY":
+                    amt = -(q * p + ch)
+                    qty += q
+                    invested += (q * p + ch)
+                else:
+                    amt = +(q * p - ch)
+                    qty -= q
+                    realized += (q * p - ch)
+
+                cashflows.append((dt, amt))
+                portfolio_cashflows.append((dt, amt))
+
+            cmp_val = cmp_map.get(tkr, 0.0)
+            current_value = qty * cmp_val
+            if abs(current_value) > 0:
+                cashflows.append((valuation_date, current_value))
+
+            r = xirr(cashflows)
+
+            stock_rows.append({
+                "Ticker": tkr,
+                "Holding Qty": round(qty, 2),
+                "CMP": round(cmp_val, 2),
+                "Current Value": round(current_value, 2),
+                "Total Invested": round(invested, 2),
+                "Total Realized": round(realized, 2),
+                "XIRR %": None if r is None else round(r * 100, 2)
+            })
+
+        stock_df = pd.DataFrame(stock_rows)
+
+        total_current_value = stock_df["Current Value"].sum()
+        portfolio_cashflows.append((valuation_date, total_current_value))
+
+        portfolio_xirr = xirr(portfolio_cashflows)
+        nifty_xirr, _ = compute_nifty_xirr(portfolio_cashflows, valuation_date)
+
+        st.subheader("📌 Stock-wise XIRR")
         st.dataframe(stock_df, use_container_width=True, hide_index=True)
-        st.divider()
-st.subheader("📊 Benchmark vs NIFTY 50")
 
-        st.download_button(
-            "⬇️ Download results CSV",
-            data=stock_df.to_csv(index=False).encode("utf-8"),
-            file_name="stock_xirr_results.csv",
-            mime="text/csv"
-        )
-st.divider()
-st.subheader("📊 Benchmark vs NIFTY 50")
-        
-        st.info(
-            "XIRR = BUY/SELL cashflows + terminal valuation cashflow (Qty×CMP) on the valuation date. "
-            "If CMP is wrong or corporate actions/dividends matter, XIRR will be skewed."
+        st.subheader("📊 Portfolio vs NIFTY 50")
+        if portfolio_xirr is not None and nifty_xirr is not None:
+            alpha = portfolio_xirr - nifty_xirr
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Portfolio XIRR (%)", f"{portfolio_xirr*100:.2f}%")
+            c2.metric("NIFTY XIRR (%)", f"{nifty_xirr*100:.2f}%")
+            c3.metric("Alpha (%)", f"{alpha*100:.2f}%")
+        else:
+            st.warning("Benchmark XIRR could not be computed.")
+
+        st.caption(
+            "Benchmark uses NIFTY 50 price index (^NSEI). Dividends are excluded."
         )
