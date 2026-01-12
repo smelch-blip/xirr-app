@@ -11,12 +11,12 @@ from datetime import date, timedelta
 REQUIRED_COLUMNS = ["Ticker", "Date", "Action", "Quantity", "Price", "Charges", "CMP"]
 ACTION_ALLOWED = {"BUY", "SELL"}
 
-st.set_page_config(page_title="Portfolio XIRR + Intrinsic + NIFTY", layout="wide")
-st.title("📈 Stock-wise XIRR + Intrinsic Valuation + NIFTY Benchmark")
+st.set_page_config(page_title="Portfolio XIRR & Intrinsic Analyzer", layout="wide")
+st.title("📈 Portfolio XIRR + Intrinsic Valuation + NIFTY Benchmark")
 
 st.warning(
     "⚠️ Corporate actions (splits/bonus) and dividends are NOT auto-captured. "
-    "If quantities are not adjusted, XIRR and intrinsic comparison may be skewed."
+    "If quantities are not adjusted manually, XIRR & intrinsic comparisons may be skewed."
 )
 
 # ============================================================
@@ -45,17 +45,21 @@ def xirr(cashflows):
     return r
 
 # ============================================================
-# NIFTY BENCHMARK
+# NIFTY BENCHMARK (ROBUST)
 # ============================================================
 
 def compute_nifty_xirr(portfolio_cf, valuation_date):
     start = min(d for d, _ in portfolio_cf)
-    df = yf.download("^NSEI", start=start - timedelta(days=5),
-                     end=valuation_date + timedelta(days=5), progress=False)
+    df = yf.download(
+        "^NSEI",
+        start=start - timedelta(days=10),
+        end=valuation_date + timedelta(days=10),
+        progress=False
+    )
     if df.empty:
-        return None
+        return None, "NIFTY data unavailable"
 
-    prices = df["Close"]
+    prices = df["Close"].dropna()
     units = 0.0
     bench_cf = []
 
@@ -65,19 +69,19 @@ def compute_nifty_xirr(portfolio_cf, valuation_date):
             units += abs(amt) / px
             bench_cf.append((d, amt))
 
-    final_px = prices[prices.index <= pd.Timestamp(valuation_date)].iloc[-1]
+    final_px = prices.iloc[-1]
     bench_cf.append((valuation_date, units * final_px))
-    return xirr(bench_cf)
+    return xirr(bench_cf), "Used last available close"
 
 # ============================================================
-# INTRINSIC VALUATION (REDESIGNED)
+# INTRINSIC VALUATION (FIXED LOGIC)
 # ============================================================
 
 def classify_business(ticker):
     t = ticker.upper()
     if "BANK" in t:
         return "FINANCIAL"
-    if any(x in t for x in ["IT", "TECH"]):
+    if any(x in t for x in ["IT", "TECH", "SOFT"]):
         return "ASSET_LIGHT"
     if any(x in t for x in ["STEEL", "METAL", "ENERGY", "POWER"]):
         return "CYCLICAL"
@@ -91,17 +95,26 @@ VALUATION_RULES = {
 }
 
 def intrinsic_range(cmp, business):
+    """
+    EPV-based floor + justified ceiling
+    CMP is NOT used as anchor, only as comparator
+    """
     if cmp <= 0:
         return None, None, None
-    cfg = VALUATION_RULES[business]
-    intr_min = cmp * cfg["epv"] / 15
-    intr_max = cmp * cfg["justified"] / 15
-    return round(intr_min, 2), round(intr_max, 2), cfg["confidence"]
 
-def margin_of_safety(cmp, intr_min):
-    if cmp <= 0 or intr_min <= 0:
+    cfg = VALUATION_RULES[business]
+    # proxy normalized earnings per share ≈ CMP / 15 (market avg)
+    earnings_proxy = cmp / 15
+
+    floor = earnings_proxy * cfg["epv"]
+    ceiling = earnings_proxy * cfg["justified"]
+
+    return round(floor, 2), round(ceiling, 2), cfg["confidence"]
+
+def margin_of_safety(cmp, floor):
+    if cmp <= 0 or floor <= 0:
         return None
-    return round((intr_min - cmp) / intr_min * 100, 2)
+    return round((floor - cmp) / floor * 100, 2)
 
 # ============================================================
 # HELPERS
@@ -174,7 +187,7 @@ if uploaded:
                 "Total Invested": invested,
                 "Total Realized": realized,
                 "XIRR %": None if r is None else round(r * 100, 2),
-                "Intrinsic Range": f"{intr_min} – {intr_max}" if intr_min else "NA",
+                "Intrinsic Range (₹)": f"{intr_min} – {intr_max}" if intr_min else "NA",
                 "MoS %": mos,
                 "Valuation Confidence": conf
             })
@@ -184,12 +197,12 @@ if uploaded:
         st.dataframe(stock_df, use_container_width=True)
 
         px = xirr(portfolio_cf)
-        nx = compute_nifty_xirr(portfolio_cf, valuation_date)
+        nx, note = compute_nifty_xirr(portfolio_cf, valuation_date)
 
         st.subheader("📊 Portfolio vs NIFTY 50")
-        if px and nx:
-            st.metric("Portfolio XIRR", f"{px*100:.2f}%")
-            st.metric("NIFTY XIRR", f"{nx*100:.2f}%")
-            st.metric("Alpha", f"{(px-nx)*100:.2f}%")
-        else:
-            st.warning("Benchmark not computable today.")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Portfolio XIRR", f"{px*100:.2f}%" if px else "NA")
+        c2.metric("NIFTY XIRR", f"{nx*100:.2f}%" if nx else "NA")
+        c3.metric("Alpha", f"{(px-nx)*100:.2f}%" if px and nx else "NA")
+
+        st.caption(f"NIFTY benchmark note: {note}")
