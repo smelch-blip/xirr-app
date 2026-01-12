@@ -112,6 +112,12 @@ def xirr(cashflows):
         else:
             a, fa = mid, fm
     return (a + b) / 2.0
+    # =========================
+# BENCHMARK: NIFTY 50
+# =========================
+fetch_nifty_prices()
+align_price_on_or_before()
+compute_nifty_xirr()
 
 def make_template():
     return pd.DataFrame([
@@ -291,7 +297,9 @@ if uploaded:
             file_name="stock_xirr_results.csv",
             mime="text/csv"
         )
-
+st.divider()
+st.subheader("📊 Benchmark vs NIFTY 50")
+        
         st.info(
             "XIRR = BUY/SELL cashflows + terminal valuation cashflow (Qty×CMP) on the valuation date. "
             "If CMP is wrong or corporate actions/dividends matter, XIRR will be skewed."
