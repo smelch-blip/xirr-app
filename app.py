@@ -16,7 +16,7 @@ st.title("📈 Portfolio XIRR + Intrinsic Valuation + NIFTY Benchmark")
 
 st.warning(
     "⚠️ Corporate actions (splits/bonus) and dividends are NOT auto-captured. "
-    "If quantities are not adjusted manually, XIRR & intrinsic comparisons may be skewed."
+    "If quantities are not adjusted manually, XIRR & intrinsic values may be skewed."
 )
 
 # ============================================================
@@ -74,47 +74,73 @@ def compute_nifty_xirr(portfolio_cf, valuation_date):
     return xirr(bench_cf), "Used last available close"
 
 # ============================================================
-# INTRINSIC VALUATION (FIXED LOGIC)
+# INTRINSIC VALUATION (FINAL DESIGN)
 # ============================================================
 
-def classify_business(ticker):
-    t = ticker.upper()
-    if "BANK" in t:
-        return "FINANCIAL"
-    if any(x in t for x in ["IT", "TECH", "SOFT"]):
+def classify_business(ticker, sector):
+    if sector and "bank" in sector.lower():
+        return "BANK"
+    if sector and any(x in sector.lower() for x in ["it", "software", "pharma"]):
         return "ASSET_LIGHT"
-    if any(x in t for x in ["STEEL", "METAL", "ENERGY", "POWER"]):
+    if sector and any(x in sector.lower() for x in ["metal", "energy", "oil", "power"]):
         return "CYCLICAL"
     return "GENERAL"
 
-VALUATION_RULES = {
-    "FINANCIAL": {"epv": 8, "justified": 14, "confidence": "High"},
-    "ASSET_LIGHT": {"epv": 15, "justified": 30, "confidence": "High"},
-    "CYCLICAL": {"epv": 6, "justified": 12, "confidence": "Low"},
-    "GENERAL": {"epv": 10, "justified": 18, "confidence": "Medium"},
-}
+def get_eps_series(ticker):
+    try:
+        t = yf.Ticker(ticker)
+        fin = t.financials
+        if fin is None or fin.empty:
+            return None
+        eps = fin.loc["Net Income"] / t.info.get("sharesOutstanding", np.nan)
+        return eps.dropna()
+    except:
+        return None
 
-def intrinsic_range(cmp, business):
-    """
-    EPV-based floor + justified ceiling
-    CMP is NOT used as anchor, only as comparator
-    """
-    if cmp <= 0:
-        return None, None, None
+def intrinsic_for_stock(ticker, cmp):
+    info = yf.Ticker(ticker).info
+    sector = info.get("sector", "")
+    biz = classify_business(ticker, sector)
 
-    cfg = VALUATION_RULES[business]
-    # proxy normalized earnings per share ≈ CMP / 15 (market avg)
-    earnings_proxy = cmp / 15
+    roe = info.get("returnOnEquity")
+    bvps = info.get("bookValue")
+    trailing_eps = info.get("trailingEps")
 
-    floor = earnings_proxy * cfg["epv"]
-    ceiling = earnings_proxy * cfg["justified"]
+    eps_series = get_eps_series(ticker)
+    norm_eps_3y = eps_series.tail(3).mean() if eps_series is not None and len(eps_series) >= 3 else None
+    norm_eps_5y = eps_series.tail(5).median() if eps_series is not None and len(eps_series) >= 5 else None
 
-    return round(floor, 2), round(ceiling, 2), cfg["confidence"]
+    # BANKS
+    if biz == "BANK":
+        if bvps and roe:
+            target_pb = max(0.8, min(2.0, roe / 0.13))
+            floor = bvps * target_pb * 0.9
+            ceiling = floor * 1.25
+            return floor, ceiling, "High"
+
+    # ASSET LIGHT
+    if biz == "ASSET_LIGHT":
+        eps = norm_eps_3y or trailing_eps
+        if eps:
+            return eps * 15, eps * 28, "High"
+
+    # CYCLICAL
+    if biz == "CYCLICAL":
+        eps = norm_eps_5y or trailing_eps
+        if eps:
+            return eps * 8, eps * 14, "Low"
+
+    # GENERAL
+    eps = norm_eps_3y or trailing_eps
+    if eps:
+        return eps * 12, eps * 18, "Medium"
+
+    return None, None, "Low"
 
 def margin_of_safety(cmp, floor):
-    if cmp <= 0 or floor <= 0:
-        return None
-    return round((floor - cmp) / floor * 100, 2)
+    if cmp and floor:
+        return round((floor - cmp) / floor * 100, 2)
+    return None
 
 # ============================================================
 # HELPERS
@@ -175,9 +201,8 @@ if uploaded:
                 portfolio_cf.append((valuation_date, curr_val))
 
             r = xirr(cashflows)
-            business = classify_business(tkr)
-            intr_min, intr_max, conf = intrinsic_range(cmp, business) if qty > 0 else (None, None, None)
-            mos = margin_of_safety(cmp, intr_min) if intr_min else None
+            floor, ceiling, conf = intrinsic_for_stock(tkr, cmp)
+            mos = margin_of_safety(cmp, floor)
 
             rows.append({
                 "Ticker": tkr,
@@ -187,7 +212,7 @@ if uploaded:
                 "Total Invested": invested,
                 "Total Realized": realized,
                 "XIRR %": None if r is None else round(r * 100, 2),
-                "Intrinsic Range (₹)": f"{intr_min} – {intr_max}" if intr_min else "NA",
+                "Intrinsic Range (₹)": f"{round(floor,2)} – {round(ceiling,2)}" if floor else "NA",
                 "MoS %": mos,
                 "Valuation Confidence": conf
             })
