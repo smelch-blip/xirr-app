@@ -112,13 +112,13 @@ def xirr(cashflows):
         else:
             a, fa = mid, fm
     return (a + b) / 2.0
-    # =========================
-# BENCHMARK: NIFTY 50
 # =========================
-fetch_nifty_prices()
-align_price_on_or_before()
-compute_nifty_xirr()
-
+# BENCHMARK: NIFTY 50 XIRR
+# =========================
+import yfinance as yf
+...
+def compute_nifty_xirr(...):
+    ...
 def make_template():
     return pd.DataFrame([
         {"Ticker": "INFY", "Date": "2019-06-10", "Action": "BUY",  "Quantity": 10, "Price": 700,  "Charges": 0, "CMP": 0},
@@ -290,6 +290,8 @@ if uploaded:
 
         st.subheader("📌 Stock-wise XIRR (sorted by XIRR)")
         st.dataframe(stock_df, use_container_width=True, hide_index=True)
+        st.divider()
+st.subheader("📊 Benchmark vs NIFTY 50")
 
         st.download_button(
             "⬇️ Download results CSV",
