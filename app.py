@@ -30,12 +30,11 @@ def xnpv(rate, cashflows):
 def xirr(cashflows):
     if len(cashflows) < 2:
         return None
-    amounts = [amt for _, amt in cashflows]
-    if not (any(a < 0 for a in amounts) and any(a > 0 for a in amounts)):
+    if not (any(a < 0 for _, a in cashflows) and any(a > 0 for _, a in cashflows)):
         return None
 
     r = 0.15
-    for _ in range(50):
+    for _ in range(60):
         f = xnpv(r, cashflows)
         df = (xnpv(r + 1e-5, cashflows) - f) / 1e-5
         if abs(df) < 1e-10:
@@ -50,12 +49,8 @@ def xirr(cashflows):
 
 def compute_nifty_xirr(portfolio_cf, valuation_date):
     start = min(d for d, _ in portfolio_cf)
-    df = yf.download(
-        "^NSEI",
-        start=start - timedelta(days=10),
-        end=valuation_date + timedelta(days=10),
-        progress=False
-    )
+    df = yf.download("^NSEI", start=start - timedelta(days=10),
+                     end=valuation_date + timedelta(days=10), progress=False)
     if df.empty:
         return None, "NIFTY data unavailable"
 
@@ -74,68 +69,92 @@ def compute_nifty_xirr(portfolio_cf, valuation_date):
     return xirr(bench_cf), "Used last available close"
 
 # ============================================================
+# FUNDAMENTALS (CACHED, RATE-LIMIT SAFE)
+# ============================================================
+
+@st.cache_data(ttl=86400)
+def get_stock_fundamentals(ticker):
+    try:
+        t = yf.Ticker(ticker)
+        info = t.info
+        fin = t.financials
+
+        eps_series = None
+        shares = info.get("sharesOutstanding")
+        if fin is not None and not fin.empty and shares:
+            if "Net Income" in fin.index:
+                eps_series = (fin.loc["Net Income"] / shares).dropna()
+
+        return {
+            "sector": info.get("sector", ""),
+            "roe": info.get("returnOnEquity"),
+            "bvps": info.get("bookValue"),
+            "trailing_eps": info.get("trailingEps"),
+            "eps_series": eps_series
+        }
+    except:
+        return {}
+
+# ============================================================
 # INTRINSIC VALUATION (FINAL DESIGN)
 # ============================================================
 
-def classify_business(ticker, sector):
-    if sector and "bank" in sector.lower():
+def classify_business(sector):
+    s = sector.lower()
+    if "bank" in s:
         return "BANK"
-    if sector and any(x in sector.lower() for x in ["it", "software", "pharma"]):
+    if any(x in s for x in ["it", "software", "pharma"]):
         return "ASSET_LIGHT"
-    if sector and any(x in sector.lower() for x in ["metal", "energy", "oil", "power"]):
+    if any(x in s for x in ["metal", "energy", "oil", "power"]):
         return "CYCLICAL"
     return "GENERAL"
 
-def get_eps_series(ticker):
-    try:
-        t = yf.Ticker(ticker)
-        fin = t.financials
-        if fin is None or fin.empty:
-            return None
-        eps = fin.loc["Net Income"] / t.info.get("sharesOutstanding", np.nan)
-        return eps.dropna()
-    except:
-        return None
-
 def intrinsic_for_stock(ticker, cmp):
-    info = yf.Ticker(ticker).info
-    sector = info.get("sector", "")
-    biz = classify_business(ticker, sector)
+    data = get_stock_fundamentals(ticker)
+    if not data:
+        return None, None, "Low"
 
-    roe = info.get("returnOnEquity")
-    bvps = info.get("bookValue")
-    trailing_eps = info.get("trailingEps")
+    biz = classify_business(data["sector"])
+    eps_series = data["eps_series"]
+    trailing_eps = data["trailing_eps"]
+    roe = data["roe"]
+    bvps = data["bvps"]
 
-    eps_series = get_eps_series(ticker)
-    norm_eps_3y = eps_series.tail(3).mean() if eps_series is not None and len(eps_series) >= 3 else None
-    norm_eps_5y = eps_series.tail(5).median() if eps_series is not None and len(eps_series) >= 5 else None
-
-    # BANKS
+    # ---- BANKS ----
     if biz == "BANK":
         if bvps and roe:
             target_pb = max(0.8, min(2.0, roe / 0.13))
             floor = bvps * target_pb * 0.9
-            ceiling = floor * 1.25
-            return floor, ceiling, "High"
+            ceiling = floor * 1.20
+            return round(floor,2), round(ceiling,2), "High"
+        return None, None, "Low"
 
-    # ASSET LIGHT
+    # ---- EPS NORMALIZATION ----
+    norm_eps = None
+    confidence = "Low"
+
+    if eps_series is not None and len(eps_series) >= 3:
+        norm_eps = eps_series.tail(3).mean()
+        confidence = "High"
+    elif trailing_eps:
+        norm_eps = trailing_eps * 0.8  # conservative fallback
+        confidence = "Medium"
+
+    if not norm_eps or norm_eps <= 0:
+        return None, None, "Low"
+
+    # ---- VALUATION BY TYPE ----
     if biz == "ASSET_LIGHT":
-        eps = norm_eps_3y or trailing_eps
-        if eps:
-            return eps * 15, eps * 28, "High"
+        floor, ceiling = norm_eps * 16, norm_eps * 22
+    elif biz == "CYCLICAL":
+        floor, ceiling = norm_eps * 9, norm_eps * 13
+        confidence = "Low"
+    else:  # GENERAL
+        floor, ceiling = norm_eps * 13, norm_eps * 18
+        if confidence == "High":
+            confidence = "Medium"
 
-    # CYCLICAL
-    if biz == "CYCLICAL":
-        eps = norm_eps_5y or trailing_eps
-        if eps:
-            return eps * 8, eps * 14, "Low"
-
-    # GENERAL
-    eps = norm_eps_3y or trailing_eps
-    if eps:
-        return eps * 12, eps * 18, "Medium"
-
-    return None, None, "Low"
+    return round(floor,2), round(ceiling,2), confidence
 
 def margin_of_safety(cmp, floor):
     if cmp and floor:
@@ -212,7 +231,7 @@ if uploaded:
                 "Total Invested": invested,
                 "Total Realized": realized,
                 "XIRR %": None if r is None else round(r * 100, 2),
-                "Intrinsic Range (₹)": f"{round(floor,2)} – {round(ceiling,2)}" if floor else "NA",
+                "Intrinsic Range (₹)": f"{floor} – {ceiling}" if floor else "NA",
                 "MoS %": mos,
                 "Valuation Confidence": conf
             })
