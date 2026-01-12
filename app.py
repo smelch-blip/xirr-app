@@ -1,10 +1,3 @@
-Here is a refined, ready-to-use version of your app code with:
-
-- Safer yfinance usage (cached, no EPS-series gymnastics).
-- Cleaner intrinsic logic using trailing/normalized EPS.
-- Better null checks and display logic.
-
-```python
 import streamlit as st
 import pandas as pd
 import numpy as np
