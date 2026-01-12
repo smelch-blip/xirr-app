@@ -299,4 +299,3 @@ if uploaded:
         )
 
         st.caption(f"NIFTY benchmark note: {note}")
-```
