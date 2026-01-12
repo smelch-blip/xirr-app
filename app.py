@@ -1,6 +1,3 @@
-Here is the full, cleaned end‑to‑end app code including the fixed NIFTY logic and intrinsic valuation.
-
-```python
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -299,8 +296,3 @@ if uploaded:
         )
 
         st.caption(f"NIFTY benchmark note: {note}")
-```
-
-[1](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/11733830/5cec6895-1163-41e4-8a59-63e19c8f1845/image.jpg)
-[2](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/11733830/83e51854-ec89-4434-b3dd-3ef33ca02198/image.jpg)
-[3](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/11733830/2e4bffde-c31b-463e-8fb8-0a4cba4b49b2/image.jpg)
