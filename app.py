@@ -1,3 +1,6 @@
+Here is the full, cleaned end‑to‑end app code including the fixed NIFTY logic and intrinsic valuation.
+
+```python
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -25,7 +28,10 @@ st.warning(
 
 def xnpv(rate, cashflows):
     t0 = min(dt for dt, _ in cashflows)
-    return sum(amt / ((1 + rate) ** ((dt - t0).days / 365.25)) for dt, amt in cashflows)
+    return sum(
+        amt / ((1 + rate) ** ((dt - t0).days / 365.25))
+        for dt, amt in cashflows
+    )
 
 def xirr(cashflows):
     if len(cashflows) < 2:
@@ -39,7 +45,6 @@ def xirr(cashflows):
         df = (xnpv(r + 1e-5, cashflows) - f) / 1e-5
         if abs(df) < 1e-10:
             break
-        # Newton iteration
         try:
             r -= f / df
         except ZeroDivisionError:
@@ -48,7 +53,7 @@ def xirr(cashflows):
     return r
 
 # ============================================================
-# NIFTY BENCHMARK (ROBUST)
+# NIFTY BENCHMARK (CACHED)
 # ============================================================
 
 @st.cache_data(ttl=86400)
@@ -77,14 +82,17 @@ def compute_nifty_xirr(portfolio_cf, valuation_date):
             closest = prices[prices.index <= pd.Timestamp(d)]
             if closest.empty:
                 continue
-            px = closest.iloc[-1]
-            units += abs(amt) / px
-            bench_cf.append((d, amt))
+            px = float(closest.iloc[-1])
+            amt_f = float(amt)
+            units += abs(amt_f) / px
+            bench_cf.append((d, amt_f))
 
-    if units <= 0:
+    units = float(units)
+
+    if units <= 0.0 or len(bench_cf) == 0:
         return None, "No buys to simulate benchmark"
 
-    final_px = prices.iloc[-1]
+    final_px = float(prices.iloc[-1])
     bench_cf.append((valuation_date, units * final_px))
     return xirr(bench_cf), "Used last available close"
 
@@ -95,7 +103,7 @@ def compute_nifty_xirr(portfolio_cf, valuation_date):
 @st.cache_data(ttl=86400)
 def get_stock_fundamentals(ticker):
     """
-    Single yfinance call per ticker, cached.
+    Single yfinance call per ticker, cached for 1 day.
     Uses trailing/forward EPS and simple normalization.
     """
     try:
@@ -105,7 +113,6 @@ def get_stock_fundamentals(ticker):
         trailing_eps = info.get("trailingEps") or 0
         forward_eps = info.get("forwardEps") or 0
 
-        # Conservative normalized EPS:
         if trailing_eps and forward_eps:
             norm_eps = (trailing_eps + forward_eps) / 2
         elif trailing_eps:
@@ -132,7 +139,7 @@ def get_stock_fundamentals(ticker):
         }
 
 # ============================================================
-# INTRINSIC VALUATION (FINAL DESIGN)
+# INTRINSIC VALUATION
 # ============================================================
 
 def classify_business(sector: str):
@@ -158,9 +165,8 @@ def intrinsic_for_stock(ticker, cmp_price):
     # ---- BANKS ----
     if biz == "BANK":
         if bvps > 0 and roe:
-            # Cost of equity ~ 13% for Indian banks, clipped to reasonable bounds
             target_pb = max(0.8, min(2.0, roe / 0.13))
-            floor = bvps * target_pb * 0.9     # small MoS inside band
+            floor = bvps * target_pb * 0.9
             ceiling = floor * 1.20
             return round(floor, 2), round(ceiling, 2), "High"
         return None, None, "Low"
@@ -170,20 +176,15 @@ def intrinsic_for_stock(ticker, cmp_price):
     if eps <= 0:
         return None, None, "Low"
 
-    confidence = "Medium"
-
     # ---- VALUATION BY TYPE ----
     if biz == "ASSET_LIGHT":
-        # Quality compounders: 16–22x normalized EPS
         floor, ceiling = eps * 16, eps * 22
         confidence = "High"
     elif biz == "CYCLICAL":
-        # Cyclicals: tighter mid-cycle band with low confidence
         floor, ceiling = eps * 9, eps * 13
         confidence = "Low"
     else:  # GENERAL
         floor, ceiling = eps * 13, eps * 18
-        # Do not upgrade to High; keep Medium at best
         confidence = "Medium"
 
     return round(floor, 2), round(ceiling, 2), confidence
@@ -226,7 +227,6 @@ if uploaded:
     df = clean_df(raw)
     valuation_date = st.date_input("Valuation Date", value=date.today())
 
-    # Allow user to tweak CMPs
     cmp_df = df.groupby("Ticker")["CMP"].max().reset_index()
     cmp_edit = st.data_editor(cmp_df, hide_index=True)
 
@@ -251,14 +251,14 @@ if uploaded:
                     qty -= r["Quantity"]
                     realized += amt
 
-                cashflows.append((r["Date"], amt))
-                portfolio_cf.append((r["Date"], amt))
+                cashflows.append((r["Date"], float(amt)))
+                portfolio_cf.append((r["Date"], float(amt)))
 
             cmp_price = float(cmp_map.get(tkr, 0))
             curr_val = qty * cmp_price
             if qty > 0:
-                cashflows.append((valuation_date, curr_val))
-                portfolio_cf.append((valuation_date, curr_val))
+                cashflows.append((valuation_date, float(curr_val)))
+                portfolio_cf.append((valuation_date, float(curr_val)))
 
             r = xirr(cashflows)
             floor, ceiling, conf = intrinsic_for_stock(tkr, cmp_price)
@@ -299,3 +299,8 @@ if uploaded:
         )
 
         st.caption(f"NIFTY benchmark note: {note}")
+```
+
+[1](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/11733830/5cec6895-1163-41e4-8a59-63e19c8f1845/image.jpg)
+[2](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/11733830/83e51854-ec89-4434-b3dd-3ef33ca02198/image.jpg)
+[3](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/11733830/2e4bffde-c31b-463e-8fb8-0a4cba4b49b2/image.jpg)
