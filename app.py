@@ -15,7 +15,7 @@ REQUIRED_COLUMNS = ["Ticker", "Date", "Action", "Quantity", "Price", "Charges", 
 ACTION_ALLOWED = {"BUY", "SELL"}
 
 st.set_page_config(page_title="Portfolio XIRR + Intrinsic + NIFTY", layout="wide")
-st.title("📈 Portfolio XIRR + Intrinsic Valuation + NIFTY Benchmark")
+st.title("📈 Portfolio XIRR + Intrinsic Valuation (Multiple & DCF) + NIFTY Benchmark")
 
 st.warning(
     "⚠️ Corporate actions (splits/bonus) and dividends are NOT auto-captured in this version. "
@@ -236,10 +236,9 @@ def close_on_or_before(prices: pd.Series, d: date):
     return float(s.iloc[-1])
 
 # ============================================================
-# INTRINSIC VALUATION LOGIC (EPS/BVPS/ROE ANCHORED)
+# INTRINSIC VALUATION LOGIC - MULTIPLE-BASED (ORIGINAL)
 # ============================================================
 
-# Default assumptions (shown in UI)
 VAL_RULES = pd.DataFrame([
     {"Category": "Banks",      "Floor": "BVPS × TargetPB × 0.90", "Ceiling": "Floor × 1.25", "Key Input": "BVPS + ROE",      "Confidence": "High"},
     {"Category": "Asset-light","Floor": "Norm EPS × 15",          "Ceiling": "Norm EPS × 28", "Key Input": "Norm EPS",         "Confidence": "High"},
@@ -276,9 +275,10 @@ def compute_norm_eps(trailing_eps, forward_eps):
 
 def intrinsic_from_inputs(biz: str, roe: float, bvps: float, norm_eps: float):
     """
+    ORIGINAL MULTIPLE-BASED METHOD
     Returns (floor, ceiling, confidence, used_inputs_dict, note)
     """
-    roe = to_float_safe(roe, 0.0)  # yfinance ROE often as fraction e.g., 0.18
+    roe = to_float_safe(roe, 0.0)
     bvps = to_float_safe(bvps, 0.0)
     norm_eps = to_float_safe(norm_eps, 0.0)
 
@@ -288,7 +288,7 @@ def intrinsic_from_inputs(biz: str, roe: float, bvps: float, norm_eps: float):
     if biz == "BANK":
         if bvps > 0 and roe > 0:
             coe = 0.13
-            target_pb = max(0.8, min(2.0, roe / coe))  # ROE & CoE in same units (fraction)
+            target_pb = max(0.8, min(2.0, roe / coe))
             floor = bvps * target_pb * 0.90
             ceiling = floor * 1.25
             return floor, ceiling, "High", used, "Bank PB anchor (ROE/CoE)."
@@ -308,6 +308,92 @@ def intrinsic_from_inputs(biz: str, roe: float, bvps: float, norm_eps: float):
     floor, ceiling, conf = norm_eps * 12.0, norm_eps * 18.0, "Medium"
     return floor, ceiling, conf, used, "General EPS multiple band."
 
+# ============================================================
+# NEW: DCF-BASED INTRINSIC VALUATION
+# ============================================================
+
+def calculate_dcf_intrinsic(info: dict, shares_outstanding: float) -> tuple:
+    """
+    NEW DCF METHOD - Professional cash flow based valuation
+    Returns (dcf_intrinsic, wacc, growth_rate, confidence, note)
+    """
+    try:
+        # Get free cash flow
+        free_cash_flow = info.get('freeCashflow')
+        operating_cash_flow = info.get('operatingCashflow')
+        
+        if free_cash_flow is None and operating_cash_flow is None:
+            return None, None, None, "Low", "No cash flow data available"
+        
+        fcf = free_cash_flow if free_cash_flow else operating_cash_flow * 0.75
+        
+        if fcf <= 0:
+            return None, None, None, "Low", "Negative/zero free cash flow"
+        
+        # Get beta for WACC calculation
+        beta = info.get('beta', 1.0)
+        if beta is None or beta <= 0:
+            beta = 1.0
+        
+        # Calculate WACC using CAPM
+        risk_free_rate = 0.065  # 6.5% (Indian 10-year govt bond)
+        market_return = 0.12    # 12% expected market return
+        cost_of_equity = risk_free_rate + beta * (market_return - risk_free_rate)
+        wacc = cost_of_equity  # Simplified (assuming all equity)
+        
+        # Get revenue growth for projections
+        revenue_growth = info.get('revenueGrowth')
+        earnings_growth = info.get('earningsGrowth')
+        
+        # Determine growth rate
+        if revenue_growth and revenue_growth > 0:
+            growth_rate = min(max(revenue_growth, 0.05), 0.25)  # Between 5% and 25%
+        elif earnings_growth and earnings_growth > 0:
+            growth_rate = min(max(earnings_growth, 0.05), 0.25)
+        else:
+            growth_rate = 0.10  # Default 10%
+        
+        # Project cash flows for 5 years
+        forecast_years = 5
+        terminal_growth_rate = 0.03  # 3% perpetual growth
+        
+        present_value_cash_flows = 0.0
+        last_year_cash_flow = fcf
+        
+        for year in range(1, forecast_years + 1):
+            cash_flow = last_year_cash_flow * (1 + growth_rate)
+            discount_factor = (1 + wacc) ** year
+            present_value_cash_flows += cash_flow / discount_factor
+            last_year_cash_flow = cash_flow
+        
+        # Calculate Terminal Value
+        terminal_cash_flow = last_year_cash_flow * (1 + terminal_growth_rate)
+        terminal_value = terminal_cash_flow / (wacc - terminal_growth_rate)
+        present_value_terminal = terminal_value / ((1 + wacc) ** forecast_years)
+        
+        # Total Enterprise Value
+        enterprise_value = present_value_cash_flows + present_value_terminal
+        
+        # Intrinsic Value per Share
+        if shares_outstanding and shares_outstanding > 0:
+            intrinsic_value = enterprise_value / shares_outstanding
+        else:
+            return None, None, None, "Low", "Missing shares outstanding"
+        
+        # Determine confidence based on data quality
+        confidence = "Medium"
+        if free_cash_flow and revenue_growth and beta:
+            confidence = "High"
+        elif not free_cash_flow:
+            confidence = "Low"
+        
+        note = f"DCF: {forecast_years}yr projection @ {growth_rate*100:.1f}% growth, {wacc*100:.1f}% WACC"
+        
+        return intrinsic_value, wacc * 100, growth_rate * 100, confidence, note
+        
+    except Exception as e:
+        return None, None, None, "Low", f"DCF calculation error: {str(e)}"
+
 def margin_of_safety_vs_mid(cmp_price, floor, ceiling):
     """
     MoS vs intrinsic midpoint: (mid - price)/mid
@@ -321,6 +407,17 @@ def margin_of_safety_vs_mid(cmp_price, floor, ceiling):
     if mid <= 0:
         return None
     return (mid - cmp_price) / mid * 100.0
+
+def margin_of_safety_vs_dcf(cmp_price, dcf_intrinsic):
+    """
+    MoS vs DCF intrinsic value
+    """
+    cmp_price = to_float_safe(cmp_price, np.nan)
+    if not np.isfinite(cmp_price) or cmp_price <= 0:
+        return None
+    if dcf_intrinsic is None or dcf_intrinsic <= 0:
+        return None
+    return (dcf_intrinsic - cmp_price) / dcf_intrinsic * 100.0
 
 # ============================================================
 # NIFTY BENCHMARK (BUY + SELL MIRROR)
@@ -385,7 +482,7 @@ def compute_nifty_xirr(tx_cashflows, valuation_date: date):
     return r, "Benchmark uses ^NSEI closes; dividends excluded."
 
 # ============================================================
-# MAIN COMPUTE: STOCK XIRR + PORTFOLIO XIRR + INTRINSIC
+# MAIN COMPUTE: STOCK XIRR + PORTFOLIO XIRR + INTRINSIC (BOTH METHODS)
 # ============================================================
 
 def compute_all(df: pd.DataFrame, cmp_override_df: pd.DataFrame, valuation_date: date, default_market: str, use_autofetch: bool):
@@ -401,12 +498,7 @@ def compute_all(df: pd.DataFrame, cmp_override_df: pd.DataFrame, valuation_date:
     total_current_value = 0.0
 
     # Collect active holdings tickers (for fundamentals, if enabled)
-    # We'll compute per-stock first
     fundamentals_inputs = []
-
-    # Optional: collect per ticker fundamentals now (but do NOT fail if rate-limited)
-    # We will show an editable table after compute as well
-    # In this function we only compute intrinsic from available info.
 
     for tkr, g in df.groupby("Ticker"):
         g = g.sort_values("Date").copy()
@@ -447,11 +539,18 @@ def compute_all(df: pd.DataFrame, cmp_override_df: pd.DataFrame, valuation_date:
 
         stock_r = xirr(cashflows)
 
-        # -------- Intrinsic (use auto-fetch if enabled, else NA until user overrides) --------
+        # -------- Intrinsic Valuation (BOTH METHODS) --------
+        # Multiple-based (original)
         floor = ceiling = None
-        conf = "Low"
-        used_inputs = {}
-        val_note = ""
+        conf_multiple = "Low"
+        val_note_multiple = ""
+        
+        # DCF-based (new)
+        dcf_intrinsic = None
+        wacc = None
+        growth_rate = None
+        conf_dcf = "Low"
+        val_note_dcf = ""
 
         if qty > 0:  # only for active holdings
             if use_autofetch:
@@ -464,15 +563,22 @@ def compute_all(df: pd.DataFrame, cmp_override_df: pd.DataFrame, valuation_date:
                 bvps = info.get("bookValue", None)
                 trailing_eps = info.get("trailingEps", None)
                 forward_eps = info.get("forwardEps", None)
+                shares_outstanding = info.get("sharesOutstanding", None)
 
+                # ORIGINAL MULTIPLE-BASED METHOD
                 biz = classify_business(sector, industry)
                 norm_eps = compute_norm_eps(trailing_eps, forward_eps)
-
-                floor, ceiling, conf, used_inputs, val_note = intrinsic_from_inputs(
+                floor, ceiling, conf_multiple, used_inputs, val_note_multiple = intrinsic_from_inputs(
                     biz=biz,
                     roe=roe,
                     bvps=bvps,
                     norm_eps=norm_eps
+                )
+
+                # NEW DCF METHOD
+                dcf_intrinsic, wacc, growth_rate, conf_dcf, val_note_dcf = calculate_dcf_intrinsic(
+                    info=info,
+                    shares_outstanding=shares_outstanding
                 )
 
                 # Keep a copy for potential override editing UI
@@ -487,6 +593,7 @@ def compute_all(df: pd.DataFrame, cmp_override_df: pd.DataFrame, valuation_date:
                     "Trailing EPS": None if trailing_eps is None else float(trailing_eps),
                     "Forward EPS": None if forward_eps is None else float(forward_eps),
                     "Norm EPS (used)": float(norm_eps) if norm_eps else 0.0,
+                    "Shares Outstanding": None if shares_outstanding is None else float(shares_outstanding),
                 })
             else:
                 # still create row for override UI
@@ -501,11 +608,16 @@ def compute_all(df: pd.DataFrame, cmp_override_df: pd.DataFrame, valuation_date:
                     "Trailing EPS": None,
                     "Forward EPS": None,
                     "Norm EPS (used)": None,
+                    "Shares Outstanding": None,
                 })
-                val_note = "Auto-fetch disabled. Use overrides to compute intrinsic."
+                val_note_multiple = "Auto-fetch disabled. Use overrides to compute intrinsic."
+                val_note_dcf = "Auto-fetch disabled."
 
-        mos = margin_of_safety_vs_mid(cmp_price, floor, ceiling)
-        mid = None if (floor is None or ceiling is None) else (floor + ceiling) / 2.0
+        # Calculate Margin of Safety for both methods
+        mos_multiple = margin_of_safety_vs_mid(cmp_price, floor, ceiling)
+        mos_dcf = margin_of_safety_vs_dcf(cmp_price, dcf_intrinsic)
+        
+        mid_multiple = None if (floor is None or ceiling is None) else (floor + ceiling) / 2.0
 
         intrinsic_range = "NA"
         if floor is not None and ceiling is not None:
@@ -522,12 +634,21 @@ def compute_all(df: pd.DataFrame, cmp_override_df: pd.DataFrame, valuation_date:
             "Total Realized": round(realized, 2),
             "XIRR %": None if stock_r is None else round(stock_r * 100, 2),
 
-            # Intrinsic columns (only meaningful for active holdings)
-            "Intrinsic Range (₹)": intrinsic_range if qty > 0 else "NA",
-            "Intrinsic Mid (₹)": "NA" if qty <= 0 or mid is None else round(mid, 2),
-            "MoS % (vs Mid)": None if mos is None else round(mos, 2),
-            "Valuation Confidence": conf if qty > 0 else "NA",
-            "Valuation Note": val_note if qty > 0 else "NA",
+            # Multiple-based intrinsic (original columns)
+            "Intrinsic Range [Multiple] (₹)": intrinsic_range if qty > 0 else "NA",
+            "Intrinsic Mid [Multiple] (₹)": "NA" if qty <= 0 or mid_multiple is None else round(mid_multiple, 2),
+            "MoS % [Multiple]": None if mos_multiple is None else round(mos_multiple, 2),
+            "Confidence [Multiple]": conf_multiple if qty > 0 else "NA",
+            
+            # NEW DCF-based intrinsic columns
+            "Intrinsic [DCF] (₹)": "NA" if qty <= 0 or dcf_intrinsic is None else round(dcf_intrinsic, 2),
+            "MoS % [DCF]": None if mos_dcf is None else round(mos_dcf, 2),
+            "WACC % [DCF]": "NA" if wacc is None else round(wacc, 2),
+            "Growth % [DCF]": "NA" if growth_rate is None else round(growth_rate, 2),
+            "Confidence [DCF]": conf_dcf if qty > 0 else "NA",
+            
+            # Combined note
+            "Valuation Notes": f"Multiple: {val_note_multiple} | DCF: {val_note_dcf}" if qty > 0 else "NA",
         })
 
     stock_df = pd.DataFrame(rows)
@@ -553,129 +674,4 @@ def make_template():
         {"Ticker": "INFY", "Date": "2019-06-10", "Action": "BUY",  "Quantity": 10, "Price": 700,  "Charges": 0, "CMP": 0},
         {"Ticker": "INFY", "Date": "2020-01-15", "Action": "BUY",  "Quantity": 5,  "Price": 800,  "Charges": 0, "CMP": 0},
         {"Ticker": "INFY", "Date": "2021-05-20", "Action": "SELL", "Quantity": 3,  "Price": 1200, "Charges": 0, "CMP": 0},
-        {"Ticker": "HDFCBANK",  "Date": "2023-07-01", "Action": "BUY",  "Quantity": 2,  "Price": 1500, "Charges": 0, "CMP": 0},
-    ])
-
-with st.expander("📄 Download the exact upload format (template)"):
-    tmpl = make_template()
-    st.dataframe(tmpl, use_container_width=True, hide_index=True)
-    st.download_button(
-        "⬇️ Download template CSV",
-        data=tmpl.to_csv(index=False).encode("utf-8"),
-        file_name="PortfolioImportTemplate.csv",
-        mime="text/csv"
-    )
-    st.markdown("**Exact column names required:** `Ticker, Date, Action, Quantity, Price, Charges, CMP`")
-
-with st.expander("📌 Intrinsic valuation assumptions (defaults)"):
-    st.dataframe(VAL_RULES, use_container_width=True, hide_index=True)
-    st.caption(
-        "Intrinsic is computed from EPS/BVPS/ROE (independent of CMP). "
-        "MoS% is computed vs Intrinsic Mid (midpoint of the intrinsic band)."
-    )
-
-# ============================================================
-# SIDEBAR CONTROLS
-# ============================================================
-
-st.sidebar.header("Settings")
-default_market = st.sidebar.selectbox(
-    "Default market for plain tickers",
-    ["NSE (.NS)", "BSE (.BO)", "None (as-is)"],
-    index=0
-)
-use_autofetch = st.sidebar.toggle(
-    "Auto-fetch fundamentals (yfinance) for intrinsic",
-    value=True,
-    help="If you hit rate limits or data is missing, intrinsic may show NA. You can still fill overrides manually."
-)
-
-# ============================================================
-# UI: UPLOAD + COMPUTE
-# ============================================================
-
-st.markdown("### Upload your transactions CSV")
-uploaded = st.file_uploader("Upload CSV", type=["csv"])
-
-if uploaded:
-    raw = pd.read_csv(uploaded)
-    missing = validate_columns(raw)
-    if missing:
-        st.error(f"Missing columns: {missing}. Please use the template and keep EXACT names.")
-        st.stop()
-
-    df = clean_transactions(raw)
-    if df.empty:
-        st.error("No valid BUY/SELL rows after cleaning. Check your file.")
-        st.stop()
-
-    st.markdown("### Choose valuation date (usually today)")
-    valuation_date = st.date_input("Valuation date", value=date.today())
-
-    st.markdown("### Edit CMP per stock (manual input)")
-    cmp_df = build_cmp_table(df)
-    edited_cmp = st.data_editor(
-        cmp_df,
-        use_container_width=True,
-        hide_index=True,
-        num_rows="fixed",
-        column_config={
-            "Ticker": st.column_config.TextColumn(disabled=True),
-            "CMP": st.column_config.NumberColumn(min_value=0.0, step=0.05),
-        }
-    )
-
-    if st.button("🚀 Compute XIRR & Intrinsic"):
-        try:
-            stock_df, portfolio_r, total_cv, nifty_r, nifty_note, fundamentals_df = compute_all(
-                df=df,
-                cmp_override_df=edited_cmp,
-                valuation_date=valuation_date,
-                default_market=default_market,
-                use_autofetch=use_autofetch
-            )
-
-            # Stock table
-            st.subheader("📌 Stock-wise XIRR + Intrinsic (single table)")
-            # Sort: active holdings first, then by XIRR desc
-            stock_df["_active"] = stock_df["Holding Qty"].apply(lambda x: 1 if float(x) > 0 else 0)
-            stock_df = stock_df.sort_values(["_active", "XIRR %"], ascending=[False, False], na_position="last").drop(columns=["_active"])
-            st.dataframe(stock_df, use_container_width=True, hide_index=True)
-
-            # Download
-            st.download_button(
-                "⬇️ Download results CSV",
-                data=stock_df.to_csv(index=False).encode("utf-8"),
-                file_name="stock_xirr_intrinsic_results.csv",
-                mime="text/csv"
-            )
-
-            st.divider()
-
-            # Portfolio vs NIFTY
-            st.subheader("📊 Portfolio vs NIFTY 50")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Portfolio XIRR", "NA" if portfolio_r is None else f"{portfolio_r*100:.2f}%")
-            c2.metric("NIFTY XIRR", "NA" if nifty_r is None else f"{nifty_r*100:.2f}%")
-            alpha = None if (portfolio_r is None or nifty_r is None) else (portfolio_r - nifty_r) * 100.0
-            c3.metric("Alpha", "NA" if alpha is None else f"{alpha:.2f}%")
-            st.caption(nifty_note)
-
-            st.caption(
-                f"Portfolio terminal value used once (valuation date): ₹{total_cv:,.0f}. "
-                "Benchmark mirrors BUY and SELL cashflows into NIFTY units; dividends excluded."
-            )
-
-            st.divider()
-
-            # Optional: show fetched fundamentals for transparency + manual override guidance
-            with st.expander("🔎 Fundamentals used (for intrinsic) — transparency/debug"):
-                st.dataframe(fundamentals_df, use_container_width=True, hide_index=True)
-                st.caption(
-                    "If many values are missing due to Yahoo/yfinance limitations, intrinsic will show NA/Low. "
-                    "Best practice: manually override EPS/BVPS/ROE in a future enhancement."
-                )
-
-        except Exception:
-            st.error("A critical error occurred during computation.")
-            st.code(traceback.format_exc())
+        {"Ticker": "HDFCBANK",  "Date": "2023-07-01", "Action": "BUY",
