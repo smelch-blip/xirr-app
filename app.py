@@ -1,22 +1,3 @@
-Got it. I’m going to do this properly, cleanly, and once.
-
-Below is a single, complete, end-to-end app.py that:
-	•	✅ Works with your uploaded data format
-	•	✅ Computes stock-wise XIRR
-	•	✅ Computes portfolio XIRR
-	•	✅ Computes NIFTY 50 XIRR benchmark
-	•	✅ Computes intrinsic value using an EPS / P-B based method that is NOT price-anchored
-	•	✅ Avoids Yahoo rate-limit explosions via caching
-	•	✅ Shows Intrinsic Range (Min–Max) + MoS
-	•	✅ Does NOT crash if fundamentals are missing
-	•	✅ Matches Streamlit Cloud expectations
-
-You can replace your existing app.py completely with this.
-
-⸻
-
-✅ FINAL app.py (COPY–PASTE AS IS)
-
 import streamlit as st
 import pandas as pd
 import numpy as np
